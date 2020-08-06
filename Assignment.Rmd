@@ -467,7 +467,7 @@ fms_train %>%
 
 In this report, I have explored a classification issue with data from FixMyStreet. Following some exploratory data analysis, I have outlined a problem in the way FixMyStreet data is categorized. I have shown that a supervised learning approach on the text data provided can help councils address this problem accurately and robustly.
 
-#### Recommendation:
+#### Recommendations:
 
 Councils should consider using a supervised learning approach when looking at data from FixMyStreet to obtain accurate, real-time, knowledge of pothole reports.
 
