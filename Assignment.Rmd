@@ -1,0 +1,501 @@
+---
+output: html_document
+---
+
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse) # Easily Install and Load the 'Tidyverse'
+library(tidymodels) # Easily Install and Load the 'Tidymodels' Packages
+library(textrecipes) # Extra 'Recipes' for Text Processing
+library(themis) # Extra Recipes Steps for Dealing with Unbalanced Data
+library(vip) # Variable Importance Plots 
+library(scico) # Colour Palettes Based on the Scientific Colour-Maps
+library(ggfortify) # Data Visualization Tools for Statistical Analysis Results
+library(kableExtra) # Construct Complex Table with 'kable' and Pipe Syntax
+
+# I also used the annotater package to automatically annotate packages and the lintr package to check code style.
+```
+
+```{r Scraping the data, include = FALSE }
+#The data was obtained using the following code from Reka Solymosi (https://rekadata.net).
+
+
+# I will just read in pre-scraped data so don't have to scrape every time I knit
+
+fms_full <- read_csv("./Data/clean_fms.csv")
+
+#Creating a sub-sample of the data for speed
+
+set.seed(1234)
+
+fms_smol <- read_csv("./Data/clean_fms.csv") %>%
+  slice_sample(prop = 0.1)
+```
+
+### Sheffield Assignment: Predictive modelling using crowdsourced text data from FixMyStreet reports
+
+#### Executive Summary:
+
+There is a growing demand from local government bodies for real-time information about environmental and maintenance issues. This report looks at data from the FixMyStreet app. Noting an issue in assessing the number of pothole reports using the apps own self reported categories, I propose using a supervised learning approach on the descriptions provided with each report. I show that this approach is highly effective with cross-validated accuracy levels of over 97%. Furthermore, there is no sign of significant over-fit.
+
+#### Introduction:
+
+In this report, I look at reports made on FixMyStreet (https://www.fixmystreet.com). FixMyStreet is "a UK based issue reporting service allowing citizens to report problems in their area through a single portal that sends the report to the appropriate local authority" (Parsons, et al. 2019). 
+
+The data contains information on the type of issue, a textual description of the issue provided by the user, the date, time, and geographical location of the report, and the means through which the report was made (iPhone, Android, or online website).
+
+Most studies on crowdsourced reports, sometimes called '311 data' after the American 311 services (for example:https://portal.311.nyc.gov), focuses on the geographical and temporal aspects of the reports, and there is little analysis on the text component which may be rich with insights. 
+
+In this report, I will take a predictive modelling approach to estimate whether or not a report is about potholes based on the text provided. 
+
+I will begin by performing some exploratory analysis and then move on to pre-processing the data. 
+
+I will then fit a logistic regression model using least absolute shrinkage and selection operator (lasso) using the glmnet package. I will use 10 fold cross-validation to optimise two hyper-parameters: the amount of regularization applied, and the number of tokens retained.
+
+Finally, I will assess the performance of the model, visualize the results of the model and of the hyper-parameter optimization process, and reflect upon limitations of the model and potential further optimisations.
+
+
+#### Exploratory analysis:
+
+In this section, I will explore some of the variables in the data-set, specifically the "description" variable which contains text submitted by users providing information on the problem they are reporting, the "category" variable which contains a label describing the type of problem the user is reporting, and the "date" variable which contains the date the problem was reported.
+
+First, we can explore the text variable by looking at a random sample of reports:
+
+```{r Looking at descriptions,echo=FALSE}
+set.seed(4424) #sets random seet for reproducibility
+
+fms_smol %>%
+  sample_n(10) %>% #extracts ten reports
+  pull(description) #prints the description variable for each report
+```
+We can see that the descriptions can provide quite a rich description of the problem being reported.
+
+Our target variable is the category of the report, we can look at the most common reports by plotting a bar chart of all category types which have more than 1000 reports.
+
+```{r Looking at categories, echo = FALSE, message = FALSE}
+fms_full %>%
+  group_by(category) %>% #groups by category
+  summarise(howmany = n()) %>% #calculates how many times each category appears
+  filter(howmany > 1000) %>% #removes those with less than 1000 appearances
+  mutate(category= fct_reorder(category, howmany)) %>% #order categories by number of appearences
+  ggplot()+
+  aes(y = category, x = howmany) +
+  geom_col() +
+  labs(x = 'Number of reports', y = 'Type of report', title = 'The most common report categories:') +
+  theme_minimal()
+```
+
+Unfortunately, Fix My Street allows its users to write in their own categories.
+
+In total there are 209 different categories. Some of these categories are simply different spellings of the same issue (for example Potholes and Pothole, or Flytipping, Fly-Tipping, and Fly Tipping) and should probably be combined.
+
+After combining the above categories we end up with the following category distribution:
+
+```{r Recoding categories, echo = FALSE, message = FALSE}
+fms_smol %>%
+  group_by(category) %>%
+  mutate(category = recode(category,                      #recodes different spellings of the same category
+                           'Pothole' = 'Potholes',
+                           'Road defect' = 'Potholes',
+                           'Fly-Tipping' = 'Flytipping',
+                           'Fly Tipping' = 'Flytipping'
+                           )) %>%
+  summarise(howmany = n()) %>% 
+  filter(howmany > 100) %>% 
+  mutate(category= fct_reorder(category, howmany)) %>% 
+  ggplot()+
+  aes(y = category, x = howmany) +
+  geom_col() +
+  labs(x = 'Number of reports', y = 'Type of report', title = 'The most common report categories after merging') +
+  theme_minimal()
+```
+
+As we can see, in both instances potholes are the most reported problem.
+
+There are two issues raised by these graphs. First, there are a high number of NA's, some of which may be potholes. Secondly, tsome categories seem like they could be referring to, or at least include reports referring to, potholes such as "Carriageway Defect", "Road defect", "Highways", and "Roads/Highways".
+
+A council using the FixMyStreet app might want a reliable way of seeing how many are potholes have been reported. And since the "category" variable is not reliable, another approach might be to use a supervised learning approach on the "description" variable to create a model which can parse all the submissions and quickly determine which are referring to potholes.
+
+Another variable which may improve the fit of such a model is the date variable. We can try plotting the three most commonly reported categories over time to see if there are any obvious temporal trends:
+
+```{r Does time affect types of reports, echo=FALSE, message=FALSE}
+
+fms_full %>% 
+  filter(category %in% c('Potholes',          #selects the three most common categories
+                         'Flytipping',
+                         'Street lighting'),
+         year %in% 2017 :2018,               #makes sure the year is valid   
+         day %in% 1:31) %>%                  #same for the date
+  transmute(date = paste0(year, "-", month, "-", day ), #creates date objects
+            date = lubridate::ymd(date),
+            category) %>%
+  group_by(category, date) %>%            #groups by category
+  tally() %>%                             #counts the number of reports
+  filter(n < 150) %>%                     #removes days with over 150 reports
+  ggplot(aes(date,
+             n,
+             colour = category))+
+  geom_point(alpha = 0.5)+
+  geom_smooth() +
+  theme_minimal() +
+  labs(x = 'Date', y = 'Number of reports', color = 'Type of report', title = 'How the most common types of report vary over time:') 
+```
+
+There are a number of interesting things happening here. First, reports of flytipping see to be declining over time. 
+
+Secondly, street lighting seems to experience some seasonal variation, with reports peaking in winter and being at their lowest in summer. A likely explanation for this is that faulty street lighting is more of an issue in winter when days are shorter, an explanation which seems supported by reports being at their lowest levels towards the end of June, where the summer solstice occurs.
+
+Pothole reports seem to follow a similar pattern, though the curves appear "out of sync".
+
+In this section, I have graphically explored some of our variables of interest. In the next section, I will start pre-processing the data to fit a classification model.
+
+#### Pre-processing:
+
+In this section, I start pre-processing my data. This is done using the Tidymodels framework (Khun, et al. 2020), as well as two extensions: the themis package for upsampling (Hvitfeldt, 2020a), and the textrecipes package (Hvitfeldt, 2020b) for text processing functions.
+
+First I re-coded the "Potholes" category as "Pothole" for the reasons mentioned above.
+I then created a binary outcome for our target variable by recoding all other categories as "Other".
+
+After recoding the distribution of the category variable looked like this:
+
+```{r Creating a binary outcome, echo= FALSE, message = FALSE, warning = FALSE}
+
+fms_binary <- fms_smol %>%
+  drop_na(category) %>%                             #drops na's
+  mutate(category = recode(category,                #recodes diff spellings of pothole
+                           'Pothole' = 'Potholes'),
+         category = factor(if_else(                 #creates binary outcome
+           condition = category == "Potholes",
+           true = "Pothole", 
+           false = "Other")),
+         date = paste0(year, "-", month, "-", day ),
+         date = lubridate::ymd(date)) %>%
+  drop_na(date) %>%
+  rename(text = description)
+
+fms_binary %>%
+  group_by(category) %>% 
+  summarise(howmany = n()) %>% 
+  filter(howmany > 100) %>% 
+  mutate(category= fct_reorder(category, howmany)) %>% 
+  ggplot()+
+  aes(y = category, x = howmany) +
+  geom_col() +
+  labs(x = 'Number of reports', y = 'Type of report', title = 'Pothole reports vs Other reports') +
+  theme_minimal()
+```
+
+The second pre-processing task was to split the data into test and training data-sets.
+
+Using stratified sampling to preserve an equal amount of "Pothole" and "Other" reports in each data-set, I assigned three-quarters of the data to the training data-set, with the last quarter being held out for testing. 
+
+```{r Data splitting, echo=FALSE}
+
+#Spliting the data into testing and training sets
+
+set.seed(1234)
+
+fms_split <- initial_split(fms_binary, strata = category) #uses stratified sampling to create spit with same distribution of category in each split
+
+#creates traning and testing sets respectively
+fms_train <- training(fms_split)
+fms_test <- testing(fms_split)
+
+```
+
+I then up-sampled the number of "Pothole reports" so it matched the number of "Other" reports using the themis package. Critically, I only did this on the training data.
+
+The next step was to create dummy variables for the date, here I chose to only include information on the month and the day of the week. This is because our data spans exactly a year, removing the need for year level information, and because it seems unlikely that there are week-level effects that aren't captured by dummies for month. However, there may be effects associated with specific days of the week (for example pothole reports might be higher during weekdays where there are a large number of commuters).
+
+The next pre-processing step was to process the text data into a form that could be easily used by a machine learning algorithm.
+
+First I turned the entries into tokenlist objects: a "thin wrapper around a list of character vectors, with a few attributes" (Hvitfeldt, 2020c). This is the preferred format for text data in the Tidymodels packages. 
+
+I then removed stopwords, and created n-grams of length one and two. I then removed any n_grams which appeared less than 5 times in the data as these were too infrequent to learn from reliably (and are often just typos). I also specified that n_grams that appeared more than a certain amount of times be removed. However as good values for this can vary a lot depending on the text used, I did not specify the maximum amount, instead leaving this value as a hyper-parameter to be optimised when fitting the model.
+
+Finally, I calculated the term frequency-inverse document frequency for each token.
+
+```{r Data preprocessing, echo=FALSE}
+
+fms_rec <-
+  recipe(category ~ date + text, data = fms_train) %>% #specify dependant/independant variables and data
+  step_upsample(category) %>% #upsamples the number of Pothole reports
+  step_date(date, features = c("month", "dow"), role = "dates") %>% #selects the month and day of week and tells the model they are dates
+  step_rm(date) %>% #removes the unused date information
+  step_dummy(has_role("dates")) %>% #create dummies for variables with role date
+  step_tokenize(text) %>% #turns the description into a tokenlist object
+  step_stopwords(text) %>% #removes stopwords
+  step_ngram(text, num_tokens = 2, min_num_tokens = 1) %>% #turns our tokens into n_grams of length 1 or 2
+  step_tokenfilter(text, max_tokens = tune(), min_times = 5) %>% #removes tokens that appear less than 5 times and more than n times, where n is a hyperparameter of our model
+  step_tfidf(text) #calculates the term frequency-inverse document frequency of tokens
+```
+
+In this section I have pre-processed the data for our models, I have split the data into test and training sets, upsampled the "Pothole" category, created dummies for month and day of the week, and processed the text data in a number of ways. In the next section I will specify and fit the model. 
+
+#### Modelling:
+
+In this section, I describe the steps taken to specify and fit the model.
+
+The first step was to specify which model to use, I opted for a logistic regression model using least absolute shrinkage and selection operator (or lasso) from the glmnet package (Hastie, et al. 2010) as it is known to perform well on text classification tasks (Silge & Hvitfeldt, 2020a). The amount of regularization is set as one of the parameters to be optimized.
+
+I then created a parameter grid with many possible combinations of values to be tested for our hyper-parameters.
+
+```{r Model Specification and training grid, echo=FALSE}
+#specifying model
+lasso_spec <- logistic_reg(penalty = tune(), mixture = 1) %>% #specifies that we want a logistic regression model, specifically a lasso with the amount of regularization as a hyper-parameter to be optimized
+  set_mode("classification") %>% #specifies we want a classification
+  set_engine("glmnet") #tells tidymodels to use the lasso from the glmnet package
+
+#specifying search space
+#This creates a grid of possible combinations of values to be tested for our hyper-parameters
+
+param_grid <- grid_regular(
+  penalty(range = c(-4, 0)),
+  max_tokens(range = c(500, 2000)), 
+  levels = 5)
+
+```
+
+The hyper-parameters were optimized using k-fold cross-validation with ten folds. As with our test-train split above, the cross validation folds were created using stratified sampling which made sure the proportion of "Pothole" vs "Other" reports was similar in each fold. 
+
+```{r Specifying cross validation folds and workflow, echo=FALSE}
+set.seed(123)
+fms_folds <- vfold_cv(fms_train, strata = category)
+
+```
+
+```{r Hyper-parameter optimisation, echo = FALSE}
+
+#creates a workflow object which contains all our pre-processing steps and our model specification
+
+fms_wf <- workflow() %>%
+  add_recipe(fms_rec) %>%
+  add_model(lasso_spec)
+
+
+# set.seed(1234)
+# 
+# lasso_rs <- tune_grid(
+#   fms_wf,
+#   resamples = fms_folds,
+#   grid = param_grid, 
+#   control = control_grid(save_pred = TRUE, verbose = TRUE)
+# ) 
+
+#The above fits the model using all the components previously specified, however it takes about 5 hours to run (!) so instead use the RData file from previous runs when knitting:
+
+load("temporary.RData")
+
+```
+#### Results:
+
+In this section, I will look at the results from my model. I will look at the best performing models, visualize some of the modelling process, and visualize model performance.
+
+These are the values of the top five best performing models, ranked by area under the receiver operator curve (roc_auc), a mesure of how well a classification model has performed:
+
+```{r Finding the top five models, echo=FALSE}
+lasso_rs %>%
+  show_best("roc_auc") %>% #extracts the top five models
+  select('Amount of regularization' = penalty, 'Maximum amount of tokens'= max_tokens, 'Mean accuracy' = mean, 'Standard error' = std_err) %>%
+  kable() %>%
+  kable_styling() #makes table look nice
+
+best_roc_auc <- select_best(lasso_rs, "roc_auc") #finds the best model
+
+wf_spec_final <- finalize_workflow(fms_wf, best_roc_auc) #creates a new workflow with the best model's hyper-parameters
+```
+
+We can also visualize how the results vary according to which hyper-parameters are used:
+
+```{r Plotting results, echo=FALSE}
+autoplot(lasso_rs) 
+```
+
+As we can see, the most important hyper-parameter is the amount of regularization applied, the number of tokens retained only has a noticeable impact when the amount of regularization is low.
+
+We can also create a receiver operator curve for the best model, with each fold from the cross validation step shown in a different colour: 
+
+
+```{r roc curve for teh best model, echo = FALSE}
+collect_predictions(lasso_rs, parameters = best_roc_auc) %>%
+  group_by(id) %>%
+  roc_curve(truth = category, .pred_Other) %>%
+  autoplot()
+```
+
+This seems like a very promising result. However all the calculations so far have been using our training data and so we can not rule out over-fitting.
+
+We can apply our best performing model to our test data and see if it still performs as well.
+
+```{r plotting roc on test data to see if we have overfit, echo = FALSE}
+
+# final_fit <- last_fit(
+#   wf_spec_final, 
+#   fms_split
+# )
+
+#again, this takes a while so when knitting just use premade object in loaded RData
+
+final_fit%>%
+  collect_predictions() %>%
+  roc_curve(truth = category, .pred_Other) %>%
+  autoplot()
+
+```
+
+Luckily, our model does not appear to have significantly over-fit! However, a necessary caveat is that FixMyStreet data has a geographical component which I have not considered here. Due to spatial auto-correlation, cross-validated measures on geographical data can be over-optimistic unless a spatial cross-validation approach is used (Lovelace, et al. 2020).
+
+We can also visualize aspects of our model other than performance. For example, we can visualize which variables were the most important in swaying our model to predict each of our outcomes using the vip package (Greenwell et al, 2020). These are the top 20 most important n_grams for each outcome:
+
+```{r most important variable plot, echo=FALSE}
+
+# vi_data <- wf_spec_final %>%
+#   fit(fms_train) %>% #fits using the best performing model from above
+#   pull_workflow_fit() %>% #extracts the model fit
+#   vi(lambda = best_roc_auc$penalty) %>% #computes variable importance scores
+#   mutate(Variable = str_remove_all(Variable, "tfidf_text_")) %>% #creates new column, removes matches
+#   filter(Importance != 0) #removes words of no importance
+
+#As above, this can take a while to run, so when knitting just use:
+
+#load("temporary.RData")
+
+vi_data %>%
+  mutate(Importance = abs(Importance)) %>% #creates colums with absolute value for importance
+  filter(Importance != 0) %>% #removes values with zero importance
+  group_by(Sign) %>%
+  top_n(20, Importance) %>% #takes only the top 20 most important
+  ungroup() %>%
+  mutate(Sign = factor(Sign, c("POS", "NEG"), c("Pothole", "Other"))) %>% #specifies variables and which direction each outcome is (ie: pos values means more likely to be pothole)
+  ggplot(aes(
+    x = Importance,
+    y = fct_reorder(Variable, Importance),
+    fill = Sign
+  )) +
+  geom_col(show.legend = FALSE) +
+  scale_x_continuous(expand = c(0, 0)) +
+  facet_wrap(~Sign, scales = "free") +
+  labs(
+    y = NULL
+  )
+```
+
+Another way of visualizing model output currently being developed by Emil Hvitfeldt and Julia Silge (Hvitfeldt & Silge, 2020b) is to look at some examples of our text inputs and colour words depending of which way they pushed the classification model, and how much they influenced the decision.
+
+```{r Trying out Emil Hvitfeldts visualisation thing, echo=FALSE}
+
+#This was Emil Hvitfeldt's idea, I don't think there is a package for this yet. The code is from Emil's github (https://github.com/EmilHvitfeldt/useR2020-text-modeling-tutorial) and has only been lightly adapted.
+
+max_imp <- log(max(abs(vi_data$Importance)))
+log_neg <- function(x) {
+  sign(x) * log(abs(x))
+}
+range01 <- function(x) {
+  (log_neg(x) + (max_imp)) / (max_imp + max_imp)
+}
+
+color_fun <- scales::colour_ramp(rev(scico::scico(256, palette = "cork", begin = 0, end = 1)))
+
+highlighter <- function(x, sign) {
+  if(is.na(sign)) {
+    htmltools::span(x)
+  } else {
+    htmltools::span(htmltools::tags$em(x), style = glue::glue('color:{color_fun(range01(sign))};'))
+  }
+}
+```
+
+For these first two reports, words that pushed the model towards the "Pothole" outcome are shown in blue whilst words which suggested the "Other" outcome are shown in green. The deeper the colour, the more influential the word was in the classification outcome.
+
+**First pothole report:**
+
+```{r Visualing Pothole comment one ,echo=FALSE}
+
+fms_train %>%
+  filter(category == "Pothole", nchar(text) < 800) %>% #selects a pothole report with a text smaller than 800 words
+  slice(2) %>% #specifies which report
+  tidytext::unnest_tokens(words, text) %>% #unnests the tokens for out report
+  left_join(vi_data, by = c("words" = "Variable")) %>% #joins with the data on variable importance
+  mutate(words = map2(words, Importance, highlighter)) %>% #applies the highliter funtion from chunk 18
+  pull(words) %>% #extracts the words
+  htmltools::div() #desplays output
+```
+
+**Second report:**
+
+```{r Visualing Pothole comment two ,echo=FALSE}
+
+fms_train %>%
+  filter(category == "Pothole", nchar(text) < 800) %>%
+  slice(7) %>%
+  tidytext::unnest_tokens(words, text) %>%
+  left_join(vi_data, by = c("words" = "Variable")) %>%
+  mutate(words = map2(words, Importance, highlighter)) %>%
+  pull(words) %>%
+  htmltools::div()
+```
+This is the same thing, but for two non-pothole related reports (this time green suggests "Pothole", and blue suggests "Other").
+
+**First report:**
+
+```{r Visualising Other comment one,echo=FALSE}
+fms_train %>%
+  filter(category == "Other", nchar(text) < 800) %>%
+  slice(4) %>%
+  tidytext::unnest_tokens(words, text) %>%
+  left_join(vi_data, by = c("words" = "Variable")) %>%
+  mutate(words = map2(words, Importance/10, highlighter)) %>%
+  pull(words) %>%
+  htmltools::div()
+```
+
+**Second report:**
+
+```{r Visualising Other comment two,echo=FALSE}
+fms_train %>%
+  filter(category == "Other", nchar(text) < 800) %>%
+  slice(8) %>%
+  tidytext::unnest_tokens(words, text) %>%
+  left_join(vi_data, by = c("words" = "Variable")) %>%
+  mutate(words = map2(words, Importance/10, highlighter)) %>%
+  pull(words) %>%
+  htmltools::div()
+
+```
+
+#### Conclusion:
+
+In this report, I have explored a classification issue with data from FixMyStreet. Following some exploratory data analysis, I have outlined a problem in the way FixMyStreet data is categorized. I have shown that a supervised learning approach on the text data provided can help councils address this problem accurately and robustly.
+
+#### Recommendation:
+
+Councils should consider using a supervised learning approach when looking at data from FixMyStreet to obtain accurate, real-time, knowledge of pothole reports.
+
+Further work should consider the spatial aspect of this data, which may increase performance on new data, as well as variables such as reporting mode.
+
+#### Bibliography:
+
+Greenwell, Brandon; Brad Boehmke and Bernie Gray (2020). vip: Variable Importance Plots. R package version 0.2.2. Available: https://CRAN.R-project.org/package=vip
+
+Hastie, Trevor; Jerome Friedman, Robert Tibshirani (2010).*'Regularization Paths for Generalized Linear Models viaCoordinate Descent.'* Journal of Statistical Software, 33(1),pages 1-22. Available: http://www.jstatsoft.org/v33/i01/.
+
+Hvitfeldt, Emil. (2020a). themis: Extra Recipes Steps for Dealing with Unbalanced Data. R package version 0.1.1. Available: https://CRAN.R-project.org/package=themis
+
+Hvitfeldt, Emil. (2020b). textrecipes: Extra 'Recipes' for Text Processing. R package version 0.3.0. Available: https://CRAN.R-project.org/package=textrecipes
+
+Hvitfeldt, Emil. (2020b) 'Create tokenlist object' Available: https://textrecipes.tidymodels.org/reference/tokenlist.html
+
+Kuhn et al., (2020). Tidymodels: a collection of packages for modeling and machine learning using tidyverse principles. Available: https://www.tidymodels.org
+  
+Lovelace, Robin, Jakub Nowosad, and Jannes Muenchow.(2019) Geocomputation with R. CRC Press. Available: https://geocompr.robinlovelace.net/spatial-cv.html
+
+Parsons, Alex; Peter Matthews, Elvis Nyanzu, Alasdair Rae (Forthcoming). Dog Poo and Potholes: Patterns in citizen-reporting of local environmental quality and place-keeping
+
+Silge, Julia and Emil Hvitfeldt (2020a).Supervised Machine Learning for Text Analysis in R. Available online: https://smltar.com
+
+Silge, Julia and Emil Hvitfeldt (2020b) 'Predictive modeling with text using tidy data principles'. Available: https://github.com/EmilHvitfeldt/useR2020-text-modeling-tutorial
+
+
+#### Appendix:
+
+This report was created in RMarkdown, the code is available: 
